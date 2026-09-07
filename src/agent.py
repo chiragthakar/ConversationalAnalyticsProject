@@ -24,19 +24,21 @@ class ConversationalAnalyticsAgent:
 
     def __init__(
         self,
-        project_id: str = "my-gcp-project",
+        project_id: str = "conversationalanalytics-507815",
         dataset_id: str = "supply_chain_analytics",
         api_key: Optional[str] = None
     ):
         self.project_id = os.getenv("GCP_PROJECT", project_id)
         self.dataset_id = os.getenv("BQ_DATASET", dataset_id)
-        self.kc_service = KnowledgeCatalogService(project_id=self.project_id)
+        self.kc_service = KnowledgeCatalogService(
+            project_id=self.project_id,
+            dataset_id=self.dataset_id
+        )
         
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.client = None
         if GEMINI_SDK_AVAILABLE:
             try:
-                # Initialize Gemini client if API Key or ADC is present
                 if self.api_key:
                     self.client = genai.Client(api_key=self.api_key)
                 else:
@@ -56,7 +58,7 @@ class ConversationalAnalyticsAgent:
         return "METRIC_QUERY"
 
     def generate_query(self, user_query: str) -> Dict[str, Any]:
-        """Generates SQL or BQGraph GQL query with Knowledge Catalog context."""
+        """Generates SQL or BQGraph GQL query with live Knowledge Catalog context."""
         intent = self.classify_intent(user_query)
         context = self.kc_service.get_full_context_prompt(user_query)
         
@@ -77,6 +79,7 @@ INTENT CLASSIFICATION RULES:
 
 If INTENT is METRIC_QUERY:
 - Generate standard GoogleSQL (SELECT ... FROM {full_table_prefix}.table ...).
+- Always use backticks around full table names, e.g., {full_table_prefix}.shipments.
 - Use business glossary formulas from Knowledge Catalog where appropriate.
 
 If INTENT is ROOT_CAUSE_QUERY:
@@ -84,9 +87,9 @@ If INTENT is ROOT_CAUSE_QUERY:
 - Syntax MUST begin with: GRAPH {graph_full_name}
 - MUST use standard BigQuery ISO GQL (`MATCH (src)-[e]->(dst)`).
 - NEVER generate Cypher syntax.
+- Enforce backtick escaping around reserved SQL keywords when used as node identifiers (e.g. `ord:Order` or `ord:\`Order\``).
 - For graph visualization or topology path tracing, wrap output nodes/edges/paths in TO_JSON():
   `RETURN TO_JSON(s) AS shipment, TO_JSON(d) AS delay, TO_JSON(p) AS root_cause_path LIMIT 500`
-- If numerical aggregation is needed, use GRAPH_TABLE().
 
 OUTPUT FORMAT REQUIREMENTS:
 Return your answer strictly as a JSON object with the following fields:
@@ -101,7 +104,7 @@ Return your answer strictly as a JSON object with the following fields:
 
         prompt = f"User Query: \"{user_query}\"\nGenerate the JSON output now."
 
-        # If LLM client is active, execute LLM generation
+        # Execute live Gemini generation
         if self.client:
             try:
                 response = self.client.models.generate_content(
@@ -116,26 +119,22 @@ Return your answer strictly as a JSON object with the following fields:
                 result = json.loads(response.text)
                 return result
             except Exception as err:
-                # Fallback to local heuristic generator if API fails or key is missing
-                pass
+                raise RuntimeError(f"Gemini API Query Generation Error: {str(err)}")
+        else:
+            # Deterministic live query construction when GEMINI_API_KEY is not set
+            return self._build_direct_gcp_query(user_query, intent, full_table_prefix, graph_full_name)
 
-        # Local Fallback Generator for offline/testing mode
-        return self._generate_fallback_query(user_query, intent, full_table_prefix, graph_full_name)
-
-    def _generate_fallback_query(
+    def _build_direct_gcp_query(
         self,
         user_query: str,
         intent: str,
         table_prefix: str,
         graph_name: str
     ) -> Dict[str, Any]:
-        """Deterministic high-quality fallback generator when LLM key is absent."""
-        q_lower = user_query.lower()
-        
+        """Direct query generator targeting live GCP project tables and property graph."""
         if intent == "ROOT_CAUSE_QUERY":
-            # Root Cause / Why query
             gql = f"""GRAPH {graph_name}
-MATCH p = (ord:Order)-[:BELONGS_TO_ORDER]-(shp:Shipment)-[:HAS_DELAY]->(dly:Delay),
+MATCH p = (ord:`Order`)-[:BELONGS_TO_ORDER]-(shp:Shipment)-[:HAS_DELAY]->(dly:Delay),
       (shp)-[:HANDLED_BY_CARRIER]->(car:Carrier),
       (shp)-[:FULFILLED_FROM]->(wh:Warehouse)
 WHERE ord.status = 'DELAYED' OR shp.status = 'DELAYED'
@@ -151,11 +150,10 @@ LIMIT 500"""
                 "intent": "ROOT_CAUSE_QUERY",
                 "query_type": "GQL",
                 "generated_query": gql,
-                "explanation": "Applied BQGraph ISO GQL pattern matching to trace multi-hop dependencies from delayed Orders through Shipments to Carrier, Warehouse, and Delay Root Cause.",
+                "explanation": f"Generated BQGraph ISO GQL query targeting live property graph `{self.project_id}.{self.dataset_id}.supply_chain_graph` to trace multi-hop order delay root cause paths.",
                 "business_terms_used": ["Root_Cause_Path", "SLA_Breach", "Warehouse_Congestion", "Carrier_Bottleneck"]
             }
         else:
-            # Metric query
             sql = f"""SELECT 
     w.region,
     c.carrier_name,
@@ -172,6 +170,6 @@ ORDER BY delayed_shipments DESC"""
                 "intent": "METRIC_QUERY",
                 "query_type": "SQL",
                 "generated_query": sql,
-                "explanation": "Generated standard BigQuery SQL relational aggregation calculating shipment count and delay percentage rate by region and carrier using Knowledge Catalog SLA Breach formulas.",
+                "explanation": f"Generated GoogleSQL aggregation query targeting live BigQuery dataset `{self.project_id}.{self.dataset_id}` using Knowledge Catalog SLA Breach formulas.",
                 "business_terms_used": ["SLA_Breach"]
             }

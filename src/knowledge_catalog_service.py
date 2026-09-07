@@ -1,32 +1,45 @@
 """
-Knowledge Catalog & Dataplex Metadata Context Provider.
+Live Knowledge Catalog & BigQuery Schema Metadata Provider.
 
-This service fetches business glossaries, schema definitions, column tags,
-and metric definitions from GCP Dataplex / Knowledge Catalog to enrich
-the LLM prompt context before NL-to-SQL or NL-to-GQL conversion.
+Fetches real table schemas, column data types, field descriptions, and business glossary metadata
+directly from Google Cloud BigQuery and Dataplex Catalog APIs.
 """
 
 import os
 from typing import Dict, Any, List, Optional
+
+from google.cloud import bigquery
+
 try:
-    from google.cloud import datacatalog_v1
     from google.cloud import dataplex_v1
-    GCP_CATALOG_AVAILABLE = True
+    DATAPLEX_AVAILABLE = True
 except ImportError:
-    GCP_CATALOG_AVAILABLE = False
+    DATAPLEX_AVAILABLE = False
 
 
 class KnowledgeCatalogService:
-    """Service to retrieve business terms, metric definitions, and schema context."""
+    """Service to retrieve live business glossaries, metric definitions, and BigQuery schema context."""
 
-    def __init__(self, project_id: str = "my-gcp-project", location: str = "us-central1"):
+    def __init__(
+        self,
+        project_id: str = "conversationalanalytics-507815",
+        dataset_id: str = "supply_chain_analytics",
+        location: str = "us-central1"
+    ):
         self.project_id = os.getenv("GCP_PROJECT", project_id)
+        self.dataset_id = os.getenv("BQ_DATASET", dataset_id)
         self.location = os.getenv("GCP_LOCATION", location)
         
-        # In-memory Business Context & Glossaries (matches GCP Data Catalog / Dataplex taxonomies)
+        self.bq_client = None
+        try:
+            self.bq_client = bigquery.Client(project=self.project_id)
+        except Exception:
+            self.bq_client = None
+
+        # Standard Enterprise Business Glossary Taxonomy (Dataplex / Data Catalog Taxonomies)
         self.business_glossary: Dict[str, Dict[str, str]] = {
             "SLA_Breach": {
-                "definition": "A shipment whose delay_hours > 24 or whose delivery date exceeds estimated delivery.",
+                "definition": "A shipment whose delay_hours > 24 or whose delivery date exceeds estimated SLA.",
                 "formula": "COUNT(CASE WHEN delay_hours > 24 THEN 1 END) / COUNT(shipment_id)",
                 "category": "Key Performance Metric"
             },
@@ -42,131 +55,123 @@ class KnowledgeCatalogService:
             },
             "Root_Cause_Path": {
                 "definition": "Multi-hop graph traversal path connecting an Order to Shipment, Carrier, Warehouse, and Delay cause.",
-                "formula": "GQL Pattern: (Order)<-[:BELONGS_TO_ORDER]-(Shipment)-[:HAS_DELAY]->(Delay)",
+                "formula": "GQL Pattern: MATCH p = (Order)-[:BELONGS_TO_ORDER]-(Shipment)-[:HAS_DELAY]->(Delay)",
                 "category": "BQGraph Traversal"
             }
         }
 
-        self.table_schemas: Dict[str, Dict[str, Any]] = {
-            "warehouses": {
-                "description": "Fulfillment center warehouses holding product inventory.",
-                "columns": {
-                    "warehouse_id": "Primary key for warehouse (STRING)",
-                    "warehouse_name": "Full name of fulfillment center (STRING)",
-                    "region": "Geographic location e.g. US-WEST, US-MIDWEST (STRING)",
-                    "capacity": "Total unit handling capacity (INT64)",
-                    "status": "Operational status: ACTIVE, CONGESTED, INACTIVE (STRING)"
-                }
-            },
-            "carriers": {
-                "description": "Logistics and shipping carriers handling transport.",
-                "columns": {
-                    "carrier_id": "Primary key for carrier (STRING)",
-                    "carrier_name": "Carrier enterprise name (STRING)",
-                    "transport_type": "Mode of transit: AIR, TRUCK, RAIL (STRING)",
-                    "reliability_score": "Historical on-time score between 0.0 and 1.0 (FLOAT64)"
-                }
-            },
-            "orders": {
-                "description": "Customer purchase orders.",
-                "columns": {
-                    "order_id": "Primary key for customer order (STRING)",
-                    "customer_id": "Unique customer identifier (STRING)",
-                    "order_date": "Timestamp when order was placed (TIMESTAMP)",
-                    "total_amount": "Total order dollar value (NUMERIC)",
-                    "status": "Order state: PENDING, DELIVERED, DELAYED, CANCELLED (STRING)"
-                }
-            },
-            "shipments": {
-                "description": "Package shipments associated with orders.",
-                "columns": {
-                    "shipment_id": "Primary key for shipment (STRING)",
-                    "order_id": "Foreign key referencing orders.order_id (STRING)",
-                    "warehouse_id": "Foreign key referencing warehouses.warehouse_id (STRING)",
-                    "carrier_id": "Foreign key referencing carriers.carrier_id (STRING)",
-                    "shipped_date": "Timestamp package left warehouse (TIMESTAMP)",
-                    "delivery_date": "Timestamp package reached destination (TIMESTAMP)",
-                    "status": "Shipment status: IN_TRANSIT, DELIVERED, DELAYED (STRING)"
-                }
-            },
-            "shipment_delays": {
-                "description": "Detailed incident records of logistics and supply chain delays.",
-                "columns": {
-                    "delay_id": "Primary key for delay record (STRING)",
-                    "shipment_id": "Foreign key referencing shipments.shipment_id (STRING)",
-                    "delay_code": "Category code e.g. RAIL_CONGESTION, WH_BACKLOG, WEATHER (STRING)",
-                    "delay_reason": "Detailed description of delay cause (STRING)",
-                    "delay_hours": "Number of impact hours lost (INT64)",
-                    "location": "Physical location where delay occurred (STRING)"
-                }
-            }
-        }
+    def fetch_live_table_schemas(self) -> Dict[str, Dict[str, Any]]:
+        """Queries BigQuery API directly to inspect table columns and data types."""
+        schemas = {}
+        if not self.bq_client:
+            return schemas
 
-        self.property_graph_schema: Dict[str, Any] = {
-            "graph_name": "supply_chain_graph",
-            "description": "BigQuery Property Graph representing supply chain dependencies for root cause analysis.",
-            "nodes": [
-                {"label": "Warehouse", "table": "warehouses", "key": "warehouse_id", "properties": ["warehouse_id", "warehouse_name", "region", "status"]},
-                {"label": "Order", "table": "orders", "key": "order_id", "properties": ["order_id", "customer_id", "order_date", "status"]},
-                {"label": "Carrier", "table": "carriers", "key": "carrier_id", "properties": ["carrier_id", "carrier_name", "transport_type", "reliability_score"]},
-                {"label": "Shipment", "table": "shipments", "key": "shipment_id", "properties": ["shipment_id", "shipped_date", "delivery_date", "status"]},
-                {"label": "Delay", "table": "shipment_delays", "key": "delay_id", "properties": ["delay_id", "delay_code", "delay_reason", "delay_hours", "location"]}
-            ],
-            "edges": [
-                {"label": "FULFILLED_FROM", "source": "Shipment", "destination": "Warehouse", "properties": []},
-                {"label": "BELONGS_TO_ORDER", "source": "Shipment", "destination": "Order", "properties": []},
-                {"label": "HANDLED_BY_CARRIER", "source": "Shipment", "destination": "Carrier", "properties": []},
-                {"label": "HAS_DELAY", "source": "Shipment", "destination": "Delay", "properties": []}
-            ]
-        }
-
-    def fetch_dataplex_entry(self, entry_name: str) -> Optional[Dict[str, Any]]:
-        """Fetch live entry from GCP Dataplex / Data Catalog if available."""
-        if not GCP_CATALOG_AVAILABLE:
-            return None
         try:
-            client = datacatalog_v1.DataCatalogClient()
-            # Construct standard entry path if provided
-            request = datacatalog_v1.GetEntryRequest(name=entry_name)
-            entry = client.get_entry(request=request)
-            return {
-                "name": entry.name,
-                "display_name": entry.display_name,
-                "description": entry.description,
-                "schema": entry.schema
-            }
+            dataset_ref = self.bq_client.dataset(self.dataset_id, project=self.project_id)
+            tables = list(self.bq_client.list_tables(dataset_ref))
+
+            for table_item in tables:
+                table_id = table_item.table_id
+                full_table = self.bq_client.get_table(table_item.reference)
+                
+                cols = {}
+                for field in full_table.schema:
+                    desc = field.description or f"{field.field_type} field"
+                    cols[field.name] = f"{field.field_type} - {desc}"
+
+                schemas[table_id] = {
+                    "description": full_table.description or f"BigQuery table `{table_id}`",
+                    "num_rows": full_table.num_rows,
+                    "columns": cols
+                }
         except Exception:
-            return None
+            pass
+
+        return schemas
+
+    def fetch_dataplex_glossary(self) -> List[Dict[str, Any]]:
+        """Queries live Business Glossary Term Entries published in GCP Dataplex Catalog."""
+        results = []
+        if not DATAPLEX_AVAILABLE or not self.project_id:
+            return results
+
+        try:
+            client = dataplex_v1.CatalogServiceClient()
+            entry_group_parent = f"projects/{self.project_id}/locations/{self.location}/entryGroups/supply-chain-glossary-group"
+            
+            for entry in client.list_entries(parent=entry_group_parent):
+                display_name = entry.entry_source.display_name if (entry.entry_source and entry.entry_source.display_name) else entry.name
+                desc = entry.entry_source.description if entry.entry_source else ""
+                results.append({
+                    "relative_resource_name": entry.name,
+                    "search_result_subtype": "Dataplex Glossary Term Entry",
+                    "display_name": display_name,
+                    "description": desc
+                })
+        except Exception:
+            pass
+
+        return results
 
     def get_full_context_prompt(self, user_query: str) -> str:
-        """Constructs a comprehensive Context Block combining Business Glossary and Schemas."""
+        """Constructs live prompt context incorporating BigQuery API schemas and glossaries."""
         glossary_str = "\n".join([
             f"- **{term}**: {data['definition']} (Category: {data['category']})"
             for term, data in self.business_glossary.items()
         ])
 
+        live_schemas = self.fetch_live_table_schemas()
         tables_str = ""
-        for tbl, info in self.table_schemas.items():
-            tables_str += f"\nTable `{tbl}` ({info['description']}):\n"
-            for col, desc in info['columns'].items():
-                tables_str += f"  - `{col}`: {desc}\n"
+        
+        if live_schemas:
+            for tbl, info in live_schemas.items():
+                tables_str += f"\nLive BigQuery Table `{self.project_id}.{self.dataset_id}.{tbl}` (Rows: {info.get('num_rows', 'N/A')}):\n"
+                for col, desc in info['columns'].items():
+                    tables_str += f"  - `{col}`: {desc}\n"
+        else:
+            tables_str = f"""
+Table `{self.project_id}.{self.dataset_id}.warehouses`: warehouse_id (STRING), warehouse_name (STRING), region (STRING), capacity (INT64), status (STRING)
+Table `{self.project_id}.{self.dataset_id}.orders`: order_id (STRING), customer_id (STRING), order_date (TIMESTAMP), total_amount (NUMERIC), status (STRING)
+Table `{self.project_id}.{self.dataset_id}.carriers`: carrier_id (STRING), carrier_name (STRING), transport_type (STRING), reliability_score (FLOAT64)
+Table `{self.project_id}.{self.dataset_id}.shipments`: shipment_id (STRING), order_id (STRING), warehouse_id (STRING), carrier_id (STRING), shipped_date (TIMESTAMP), delivery_date (TIMESTAMP), status (STRING)
+Table `{self.project_id}.{self.dataset_id}.shipment_delays`: delay_id (STRING), shipment_id (STRING), delay_code (STRING), delay_reason (STRING), delay_hours (INT64), location (STRING)
+"""
 
-        graph_str = f"Property Graph Name: `{self.property_graph_schema['graph_name']}`\n"
-        graph_str += "Nodes:\n"
-        for n in self.property_graph_schema["nodes"]:
-            graph_str += f"  - :{n['label']} (Key: {n['key']}, Table: `{n['table']}`)\n"
-        graph_str += "Edges:\n"
-        for e in self.property_graph_schema["edges"]:
-            graph_str += f"  - ({e['source']}) -[:{e['label']}]-> ({e['destination']})\n"
+        graph_str = f"""
+BigQuery Property Graph Name: `{self.project_id}.{self.dataset_id}.supply_chain_graph`
+Node Labels:
+  - :Warehouse (Key: warehouse_id)
+  - :Order (Key: order_id) -- Note: Order is a reserved word, always escape as `Order` in DDL/GQL pattern bindings
+  - :Carrier (Key: carrier_id)
+  - :Shipment (Key: shipment_id)
+  - :Delay (Key: delay_id)
+
+Edge Labels:
+  - (Shipment)-[:FULFILLED_FROM]->(Warehouse)
+  - (Shipment)-[:BELONGS_TO_ORDER]->(`Order`)
+  - (Shipment)-[:HANDLED_BY_CARRIER]->(Carrier)
+  - (Shipment)-[:HAS_DELAY]->(Delay)
+"""
+
+        dataplex_entries = self.fetch_dataplex_glossary()
+        dataplex_str = ""
+        if dataplex_entries:
+            dataplex_str = "GCP DATAPLEX CATALOG GLOSSARY ENTRIES:\n" + "\n".join([
+                f"- Term Entry: {item['display_name']} ({item['relative_resource_name']}): {item.get('description', '')}"
+                for item in dataplex_entries
+            ]) + "\n\n"
 
         context_block = f"""
 ================================================================================
-BUSINESS CONTEXT FROM GCP KNOWLEDGE CATALOG
+LIVE BUSINESS & SCHEMA CONTEXT FROM GCP BIGQUERY / KNOWLEDGE CATALOG
 ================================================================================
+GCP PROJECT: `{self.project_id}`
+BIGQUERY DATASET: `{self.dataset_id}`
+
 BUSINESS GLOSSARY & METRIC DEFINITIONS:
 {glossary_str}
 
-RELATIONAL SCHEMAS:
+{dataplex_str}LIVE TABLE SCHEMAS:
 {tables_str}
 
 BIGQUERY PROPERTY GRAPH SCHEMA (BQGraph):

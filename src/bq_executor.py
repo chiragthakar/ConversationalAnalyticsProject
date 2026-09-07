@@ -1,8 +1,8 @@
 """
-BigQuery & BQGraph Query Executor.
+Live BigQuery & BQGraph Query Executor.
 
-Executes GoogleSQL queries and ISO GQL property graph queries on Google Cloud BigQuery.
-Parses query outputs into pandas DataFrames (tabular) or NetworkX/PyVis structures (graph topology).
+Executes GoogleSQL queries and ISO GQL property graph queries directly on BigQuery.
+Parses live query outputs into pandas DataFrames (tabular) or NetworkX/PyVis structures (graph topology).
 """
 
 import os
@@ -10,42 +10,111 @@ import json
 import pandas as pd
 from typing import Dict, Any, List, Tuple, Optional
 
-try:
-    from google.cloud import bigquery
-    BQ_CLIENT_AVAILABLE = True
-except ImportError:
-    BQ_CLIENT_AVAILABLE = False
+import db_dtypes
+from google.cloud import bigquery
 
 
 class BigQueryExecutor:
     """Executes SQL and GQL queries on BigQuery, formatting tabular and graph outputs."""
 
-    def __init__(self, project_id: str = "my-gcp-project"):
+    def __init__(self, project_id: str = "conversationalanalytics-507815"):
         self.project_id = os.getenv("GCP_PROJECT", project_id)
         self.client = None
-        if BQ_CLIENT_AVAILABLE:
-            try:
-                self.client = bigquery.Client(project=self.project_id)
-            except Exception:
-                self.client = None
+        try:
+            self.client = bigquery.Client(project=self.project_id)
+        except Exception as err:
+            self.client = None
+            self.init_error = str(err)
 
-    def execute_query(self, query: str, query_type: str = "SQL") -> Tuple[pd.DataFrame, Dict[str, Any]]:
-        """Executes query and returns (dataframe_results, graph_metadata)."""
-        if self.client:
-            try:
-                query_job = self.client.query(query)
-                results_df = query_job.to_dataframe()
+    def execute_query(
+        self,
+        query: str,
+        query_type: str = "SQL",
+        dataset_id: str = "supply_chain_analytics"
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """Executes query directly on Google Cloud BigQuery."""
+        if not self.client:
+            raise RuntimeError(f"BigQuery Client Initialization Error: Could not connect to GCP project '{self.project_id}'.")
+
+        try:
+            query_job = self.client.query(query)
+            results_df = query_job.to_dataframe()
+            
+            graph_metadata = {}
+            if query_type == "GQL":
+                graph_metadata = self.parse_gql_json_results(results_df)
                 
-                graph_metadata = {}
-                if query_type == "GQL":
-                    graph_metadata = self.parse_gql_json_results(results_df)
+            return results_df, graph_metadata
+        except Exception as e:
+            err_msg = str(e)
+            
+            # Special handling for BQGraph Enterprise Edition requirement
+            if "require a reservation with Enterprise or Enterprise Plus edition" in err_msg:
+                # Run equivalent live SQL graph traversal query on live tables to return actual data
+                fallback_sql = f"""
+                SELECT 
+                    o.order_id,
+                    o.status AS order_status,
+                    s.shipment_id,
+                    w.warehouse_name,
+                    w.region AS warehouse_region,
+                    c.carrier_name,
+                    d.delay_code,
+                    d.delay_reason,
+                    d.delay_hours
+                FROM `{self.project_id}.{dataset_id}.orders` o
+                JOIN `{self.project_id}.{dataset_id}.shipments` s ON o.order_id = s.order_id
+                JOIN `{self.project_id}.{dataset_id}.warehouses` w ON s.warehouse_id = w.warehouse_id
+                JOIN `{self.project_id}.{dataset_id}.carriers` c ON s.carrier_id = c.carrier_id
+                LEFT JOIN `{self.project_id}.{dataset_id}.shipment_delays` d ON s.shipment_id = d.shipment_id
+                WHERE o.status = 'DELAYED' OR s.status = 'DELAYED'
+                """
+                fallback_job = self.client.query(fallback_sql)
+                df = fallback_job.to_dataframe()
+                
+                # Build graph nodes and edges directly from live BigQuery table rows
+                nodes = []
+                edges = []
+                seen_nodes = set()
+
+                for _, row in df.iterrows():
+                    ord_id = str(row["order_id"])
+                    shp_id = str(row["shipment_id"])
+                    wh_name = str(row["warehouse_name"])
+                    car_name = str(row["carrier_name"])
+                    dly_code = str(row.get("delay_code") or "DELAY")
+
+                    if ord_id not in seen_nodes:
+                        nodes.append({"id": ord_id, "label": f"Order: {ord_id}", "group": "Order", "title": f"Status: {row['order_status']}"})
+                        seen_nodes.add(ord_id)
                     
-                return results_df, graph_metadata
-            except Exception as e:
-                # If execution against GCP fails (e.g., mock project ID), fallback to simulated response
-                return self._simulate_execution(query, query_type, str(e))
-        else:
-            return self._simulate_execution(query, query_type, "No GCP BigQuery client authenticated.")
+                    if shp_id not in seen_nodes:
+                        nodes.append({"id": shp_id, "label": f"Shipment: {shp_id}", "group": "Shipment", "title": "Status: DELAYED"})
+                        seen_nodes.add(shp_id)
+                        edges.append({"from": shp_id, "to": ord_id, "label": "BELONGS_TO_ORDER"})
+
+                    if wh_name not in seen_nodes:
+                        nodes.append({"id": wh_name, "label": f"Warehouse: {wh_name}", "group": "Warehouse", "title": f"Region: {row['warehouse_region']}"})
+                        seen_nodes.add(wh_name)
+                        edges.append({"from": shp_id, "to": wh_name, "label": "FULFILLED_FROM"})
+
+                    if car_name not in seen_nodes:
+                        nodes.append({"id": car_name, "label": f"Carrier: {car_name}", "group": "Carrier", "title": "Transport Carrier"})
+                        seen_nodes.add(car_name)
+                        edges.append({"from": shp_id, "to": car_name, "label": "HANDLED_BY_CARRIER"})
+
+                    if dly_code not in seen_nodes:
+                        nodes.append({"id": dly_code, "label": f"Delay: {dly_code} ({row['delay_hours']}h)", "group": "Delay", "title": str(row['delay_reason'])})
+                        seen_nodes.add(dly_code)
+                        edges.append({"from": shp_id, "to": dly_code, "label": "HAS_DELAY"})
+
+                return df, {
+                    "nodes": nodes,
+                    "edges": edges,
+                    "enterprise_notice": "Live Property Graph created in BigQuery (`supply_chain_graph`). Direct GQL execution on BigQuery requires an Enterprise/Enterprise Plus reservation. Topology below is dynamically built from live BigQuery table rows."
+                }
+            else:
+                raise RuntimeError(f"BigQuery Query Execution Failed: {err_msg}")
 
     def parse_gql_json_results(self, df: pd.DataFrame) -> Dict[str, Any]:
         """Parses TO_JSON() output columns from BQGraph query into nodes and edges."""
@@ -66,9 +135,7 @@ class BigQueryExecutor:
                     else:
                         continue
 
-                    # Process extracted node/edge elements
                     if isinstance(data, dict):
-                        # Node check
                         if "identifier" in data or "id" in data or "labels" in data:
                             node_id = data.get("identifier") or data.get("id") or str(hash(json.dumps(data)))
                             label = data.get("labels", ["Entity"])[0] if isinstance(data.get("labels"), list) else "Entity"
@@ -83,62 +150,3 @@ class BigQueryExecutor:
                     continue
 
         return {"nodes": list(nodes.values()), "edges": edges}
-
-    def _simulate_execution(
-        self,
-        query: str,
-        query_type: str,
-        error_msg: str
-    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-        """Simulates dataset query output for local demo and offline testing."""
-        if query_type == "GQL":
-            # Mock BQGraph response
-            raw_data = [
-                {
-                    "order_node": json.dumps({"labels": ["Order"], "id": "ORD-9001", "properties": {"status": "DELAYED", "amount": 1250.0}}),
-                    "shipment_node": json.dumps({"labels": ["Shipment"], "id": "SHP-501", "properties": {"status": "DELAYED"}}),
-                    "carrier_node": json.dumps({"labels": ["Carrier"], "id": "CR-03", "properties": {"name": "Coastal Rail & Road", "reliability": 0.81}}),
-                    "warehouse_node": json.dumps({"labels": ["Warehouse"], "id": "WH-103", "properties": {"name": "Chicago Express Hub", "status": "CONGESTED"}}),
-                    "delay_node": json.dumps({"labels": ["Delay"], "id": "DLY-01", "properties": {"code": "RAIL_CONGESTION", "hours": 36, "reason": "Interchange bottleneck"}}),
-                    "root_cause_path": "ORD-9001 -> SHP-501 -> [CR-03 & WH-103] -> DLY-01 (36 hrs)"
-                },
-                {
-                    "order_node": json.dumps({"labels": ["Order"], "id": "ORD-9003", "properties": {"status": "DELAYED", "amount": 3200.0}}),
-                    "shipment_node": json.dumps({"labels": ["Shipment"], "id": "SHP-503", "properties": {"status": "DELAYED"}}),
-                    "carrier_node": json.dumps({"labels": ["Carrier"], "id": "CR-03", "properties": {"name": "Coastal Rail & Road", "reliability": 0.81}}),
-                    "warehouse_node": json.dumps({"labels": ["Warehouse"], "id": "WH-103", "properties": {"name": "Chicago Express Hub", "status": "CONGESTED"}}),
-                    "delay_node": json.dumps({"labels": ["Delay"], "id": "DLY-02", "properties": {"code": "WH_BACKLOG", "hours": 24, "reason": "High volume sorting backlog"}}),
-                    "root_cause_path": "ORD-9003 -> SHP-503 -> WH-103 -> DLY-02 (24 hrs)"
-                }
-            ]
-            df = pd.DataFrame(raw_data)
-            
-            nodes = [
-                {"id": "ORD-9001", "label": "Order: ORD-9001 (DELAYED)", "group": "Order", "title": "Amount: $1250.00"},
-                {"id": "ORD-9003", "label": "Order: ORD-9003 (DELAYED)", "group": "Order", "title": "Amount: $3200.00"},
-                {"id": "SHP-501", "label": "Shipment: SHP-501", "group": "Shipment", "title": "Status: DELAYED"},
-                {"id": "SHP-503", "label": "Shipment: SHP-503", "group": "Shipment", "title": "Status: DELAYED"},
-                {"id": "WH-103", "label": "Warehouse: WH-103 (Chicago)", "group": "Warehouse", "title": "Status: CONGESTED"},
-                {"id": "CR-03", "label": "Carrier: CR-03 (Coastal Rail)", "group": "Carrier", "title": "Reliability: 81%"},
-                {"id": "DLY-01", "label": "Delay: RAIL_CONGESTION (36h)", "group": "Delay", "title": "Reason: Interchange bottleneck"},
-                {"id": "DLY-02", "label": "Delay: WH_BACKLOG (24h)", "group": "Delay", "title": "Reason: Sorting backlog"}
-            ]
-            edges = [
-                {"from": "SHP-501", "to": "ORD-9001", "label": "BELONGS_TO_ORDER"},
-                {"from": "SHP-503", "to": "ORD-9003", "label": "BELONGS_TO_ORDER"},
-                {"from": "SHP-501", "to": "WH-103", "label": "FULFILLED_FROM"},
-                {"from": "SHP-503", "to": "WH-103", "label": "FULFILLED_FROM"},
-                {"from": "SHP-501", "to": "CR-03", "label": "HANDLED_BY_CARRIER"},
-                {"from": "SHP-503", "to": "CR-03", "label": "HANDLED_BY_CARRIER"},
-                {"from": "SHP-501", "to": "DLY-01", "label": "HAS_DELAY"},
-                {"from": "SHP-503", "to": "DLY-02", "label": "HAS_DELAY"}
-            ]
-            return df, {"nodes": nodes, "edges": edges, "simulated": True, "notice": error_msg}
-        else:
-            # Mock SQL table result
-            df = pd.DataFrame([
-                {"region": "US-MIDWEST", "carrier_name": "Coastal Rail & Road", "total_shipments": 45, "delayed_shipments": 14, "delay_percentage_rate": 31.11},
-                {"region": "US-WEST", "carrier_name": "SwiftFreight Logistics", "total_shipments": 60, "delayed_shipments": 6, "delay_percentage_rate": 10.00},
-                {"region": "US-SOUTH", "carrier_name": "Apex Air Cargo", "total_shipments": 30, "delayed_shipments": 1, "delay_percentage_rate": 3.33}
-            ])
-            return df, {"simulated": True, "notice": error_msg}
